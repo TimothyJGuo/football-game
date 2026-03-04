@@ -48,6 +48,7 @@ let defSimTimer = 0, defSimMsg = '';
 let ballAir = null;
 let sackTimer = 0;
 let gameOver = false;
+let qbRunning = false; // QB has crossed LOS and is scrambling
 
 const keys = {};
 document.addEventListener('keydown', e => {
@@ -114,14 +115,16 @@ function makeReceivers() {
 
 function makeDefenders() {
   const los = yardToY(scrimmageYard);
+  // strategy is assigned per-play at snap time; 'cover' is just a default
   return [
-    // Defensive rushers: lined up just PAST the LOS on the defensive side
-    // (toward opponent = LOWER y than LOS)
-    { x: FIELD_LEFT + FIELD_W * 0.35, y: los - 18, role: 'rush' },
-    { x: FIELD_LEFT + FIELD_W * 0.65, y: los - 18, role: 'rush' },
-    // Corners/safeties: deeper in the defensive backfield (lower y = farther toward opponent)
-    { x: FIELD_LEFT + FIELD_W * 0.18, y: los - 95, role: 'cover' },
-    { x: FIELD_LEFT + FIELD_W * 0.82, y: los - 95, role: 'cover' },
+    // 2 defensive ends — right at LOS on defensive side
+    { x: FIELD_LEFT + FIELD_W * 0.32, y: los - 18, strategy: 'cover' },
+    { x: FIELD_LEFT + FIELD_W * 0.68, y: los - 18, strategy: 'cover' },
+    // 1 middle linebacker — a few yards behind LOS
+    { x: FIELD_LEFT + FIELD_W * 0.50, y: los - 48, strategy: 'cover' },
+    // 2 cornerbacks/safeties — deep in defensive backfield
+    { x: FIELD_LEFT + FIELD_W * 0.18, y: los - 95, strategy: 'cover' },
+    { x: FIELD_LEFT + FIELD_W * 0.82, y: los - 95, strategy: 'cover' },
   ];
 }
 
@@ -134,6 +137,7 @@ function initPlay() {
   carrier = null;
   ballAir = null;
   sackTimer = 0;
+  qbRunning = false;
   state = 'PRE_SNAP';
 }
 
@@ -156,13 +160,21 @@ function handleKeyDown(key) {
     if (key === ' ') startPlay();
     if ((key === 'p' || key === 'P') && down === 4) doPunt();
   }
-  if (state === 'PLAY_ACTIVE') {
+  if (state === 'PLAY_ACTIVE' && !qbRunning) {
     const n = parseInt(key);
     if (n >= 1 && n <= 5) throwTo(n - 1);
   }
 }
 
-function startPlay() { state = 'PLAY_ACTIVE'; sackTimer = 0; }
+function startPlay() {
+  state = 'PLAY_ACTIVE';
+  sackTimer = 0;
+  qbRunning = false;
+  // Assign random defensive strategy for this play: 40% chance each defender rushes QB
+  for (const def of defenders) {
+    def.strategy = Math.random() < 0.4 ? 'rush' : 'cover';
+  }
+}
 
 function throwTo(idx) {
   const rec = receivers[idx];
@@ -211,11 +223,28 @@ function updatePlayActive() {
   moveQB();
   moveReceivers();
   moveDefenders();
-  sackTimer++;
-  for (const def of defenders) {
-    if (dist(def, qb) < TACKLE_RADIUS) { doSack(); return; }
+
+  // Detect when QB crosses the LOS (lower y = toward opponent endzone)
+  if (qb.y < yardToY(scrimmageYard)) qbRunning = true;
+
+  if (qbRunning) {
+    const qbYard = yToYard(qb.y);
+    // Touchdown: QB reaches opponent endzone
+    if (qbYard >= 90) { doTouchdown(); return; }
+    // Tackle
+    for (const def of defenders) {
+      if (dist(def, qb) < TACKLE_RADIUS) { doTackle(qbYard); return; }
+    }
+    // Out of bounds
+    if (qb.x <= FIELD_LEFT || qb.x >= FIELD_RIGHT) { doTackle(qbYard); return; }
+  } else {
+    // QB in pocket — check sack
+    sackTimer++;
+    for (const def of defenders) {
+      if (dist(def, qb) < TACKLE_RADIUS) { doSack(); return; }
+    }
+    if (sackTimer >= SACK_TIME) doSack();
   }
-  if (sackTimer >= SACK_TIME) doSack();
 }
 
 function doSack() {
@@ -285,10 +314,15 @@ function moveQB() {
   if (keys['s'] || keys['S']) qb.y += QB_SPEED;
   if (keys['a'] || keys['A']) qb.x -= QB_SPEED;
   if (keys['d'] || keys['D']) qb.x += QB_SPEED;
-  // QB stays BEHIND the LOS (higher y) — pocket is 2..15 yards behind LOS
-  const losY = yardToY(scrimmageYard);
   qb.x = clamp(qb.x, FIELD_LEFT + 5, FIELD_RIGHT - 5);
-  qb.y = clamp(qb.y, losY + 2, Math.min(H - 5, losY + 15 * PX_PER_YARD));
+  if (state === 'PRE_SNAP') {
+    // Pre-snap: pocket constraint, stay 2–15 yards behind LOS
+    const losY = yardToY(scrimmageYard);
+    qb.y = clamp(qb.y, losY + 2, Math.min(H - 5, losY + 15 * PX_PER_YARD));
+  } else {
+    // During play: QB can scramble anywhere on field
+    qb.y = clamp(qb.y, FIELD_TOP + 2, H - 5);
+  }
 }
 
 function moveReceivers() {
@@ -305,20 +339,24 @@ function moveReceivers() {
 }
 
 function moveDefenders() {
-  const rushers = defenders.filter(d => d.role === 'rush');
-  const covers  = defenders.filter(d => d.role === 'cover');
-
-  if (state === 'PLAY_ACTIVE') {
-    for (const r of rushers) moveToward(r, qb.x, qb.y, DEF_RUSH_SPEED);
-  } else if (state === 'BALL_IN_AIR' && ballAir) {
-    for (const r of rushers) moveToward(r, ballAir.rec.x, ballAir.rec.y, DEF_RUSH_SPEED);
-  }
-
-  for (const def of covers) {
-    const target = receivers.reduce(
-      (best, rec) => best === null || dist(def, rec) < dist(def, best) ? rec : best, null
-    );
-    if (target) moveToward(def, target.x, target.y, DEF_COVER_SPEED);
+  for (const def of defenders) {
+    if (qbRunning) {
+      // QB is scrambling — everyone converges on him
+      moveToward(def, qb.x, qb.y, DEF_COVER_SPEED + 0.4);
+    } else if (def.strategy === 'rush') {
+      if (state === 'BALL_IN_AIR' && ballAir) {
+        // After throw, rushers converge on the target receiver
+        moveToward(def, ballAir.rec.x, ballAir.rec.y, DEF_RUSH_SPEED);
+      } else {
+        moveToward(def, qb.x, qb.y, DEF_RUSH_SPEED);
+      }
+    } else {
+      // Cover: track nearest receiver
+      const target = receivers.reduce(
+        (best, rec) => best === null || dist(def, rec) < dist(def, best) ? rec : best, null
+      );
+      if (target) moveToward(def, target.x, target.y, DEF_COVER_SPEED);
+    }
   }
 }
 
@@ -494,12 +532,14 @@ function drawPlayer(x, y, helmetColor, jerseyColor, label, hasBall) {
   ctx.strokeStyle = 'rgba(0,0,0,0.28)'; ctx.lineWidth = 1;
   ctx.stroke();
 
-  // Jersey number / label on chest
+  // Jersey number / label on chest — drawn after jersey fill so it sits on top
   if (label) {
-    ctx.fillStyle = 'rgba(255,255,255,0.92)';
-    ctx.font = `bold ${label.length > 2 ? '6' : '7.5'}px Arial`;
+    ctx.fillStyle = 'white';
+    ctx.font = `bold ${label.length > 2 ? '8' : label.length > 1 ? '9' : '11'}px Arial`;
     ctx.textAlign = 'center';
-    ctx.fillText(label, 0, 6);
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, 0, 3);
+    ctx.textBaseline = 'alphabetic'; // reset
   }
 
   // ── Shoulder pads (bumps at top of jersey) ──
@@ -600,8 +640,8 @@ function drawEntities() {
     drawPlayer(rec.x, rec.y, '#1a7020', '#22aa28', `${rec.num}`, rec.hasBall);
   }
 
-  // QB (gold helmet, yellow jersey)
-  drawPlayer(qb.x, qb.y, '#cc9900', '#ffcc00', 'QB', false);
+  // QB (gold helmet, yellow jersey) — show ball when scrambling
+  drawPlayer(qb.x, qb.y, '#cc9900', '#ffcc00', 'QB', qbRunning);
 
   // Ball in flight
   if (ballAir && ballAir.cx !== undefined) {
@@ -635,10 +675,15 @@ function drawStateOverlay() {
     }
   }
   if (state === 'PLAY_ACTIVE') {
-    const t = 1 - sackTimer / SACK_TIME;
-    ctx.fillStyle = t > 0.4 ? 'rgba(255,255,255,0.78)' : 'rgba(255,60,60,0.95)';
-    ctx.font = '14px Arial'; ctx.textAlign = 'center';
-    ctx.fillText(`PRESS 1–5 TO THROW  |  Rush pressure: ${Math.ceil((1-t)*100)}%`, W/2, FIELD_TOP + 20);
+    if (qbRunning) {
+      ctx.fillStyle = 'rgba(255,200,0,0.95)'; ctx.font = 'bold 14px Arial'; ctx.textAlign = 'center';
+      ctx.fillText('QB SCRAMBLE — no more passes! Run to the end zone!', W/2, FIELD_TOP + 20);
+    } else {
+      const t = 1 - sackTimer / SACK_TIME;
+      ctx.fillStyle = t > 0.4 ? 'rgba(255,255,255,0.78)' : 'rgba(255,60,60,0.95)';
+      ctx.font = '14px Arial'; ctx.textAlign = 'center';
+      ctx.fillText(`PRESS 1–5 TO THROW  |  Rush pressure: ${Math.ceil((1-t)*100)}%`, W/2, FIELD_TOP + 20);
+    }
   }
   if (state === 'RECEIVER_RUNNING') {
     ctx.fillStyle = 'rgba(80,255,120,0.92)'; ctx.font = '14px Arial'; ctx.textAlign = 'center';
