@@ -6,7 +6,7 @@
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #1a1a2e; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: 'Arial', sans-serif; }
-  #canvas { border: 3px solid #444; display: block; cursor: none; }
+  #canvas { border: 3px solid #444; display: block; }
   #instructions { color: #aaa; font-size: 12px; margin-top: 8px; text-align: center; }
 </style>
 </head>
@@ -17,15 +17,11 @@
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 
-// ─── Constants ────────────────────────────────────────────────────────────────
 const W = 800, H = 620;
-const FIELD_TOP = 60;          // HUD height
-const FIELD_H = H - FIELD_TOP; // 560px
-const YARDS = 100;
-const PX_PER_YARD = FIELD_H / YARDS; // 5.6px/yd
-const ENDZONES = 10; // yards each
-const PLAY_FIELD_START = ENDZONES * PX_PER_YARD; // top endzone bottom
-const PLAY_FIELD_END = FIELD_H - ENDZONES * PX_PER_YARD; // bottom endzone top
+const FIELD_TOP = 60;
+const FIELD_H = H - FIELD_TOP;   // 560
+const PX_PER_YARD = FIELD_H / 100; // 5.6
+const ENDZONES = 10;
 const FIELD_LEFT = 40, FIELD_RIGHT = W - 40;
 const FIELD_W = FIELD_RIGHT - FIELD_LEFT;
 
@@ -33,90 +29,83 @@ const QB_SPEED = 3;
 const REC_SPEED = 3.5;
 const DEF_RUSH_SPEED = 2.2;
 const DEF_COVER_SPEED = 2.8;
-const BALL_FLIGHT_TIME = 30; // frames
-const SACK_TIME = 180;       // frames ~3s at 60fps
-const TACKLE_RADIUS = 18;
-const INTERCEPT_RADIUS = 40;
+const BALL_FLIGHT_TIME = 35;
+const SACK_TIME = 180;
+const TACKLE_RADIUS = 16;
+const INTERCEPT_RADIUS = 38;
 const DEFENSE_SIM_TIME = 180;
-const QUARTER_DURATION = 120; // seconds
+const QUARTER_DURATION = 120;
 
-// ─── State ────────────────────────────────────────────────────────────────────
 let state = 'PRE_SNAP';
 let playerScore = 0, oppScore = 0;
 let quarter = 1, timeLeft = QUARTER_DURATION;
 let lastTime = 0, timerAccum = 0;
 let down = 1, distance = 10;
-let scrimmageYard = 20; // yards from own endzone
-let firstDownYard = scrimmageYard + distance;
+let scrimmageYard = 20;
+let firstDownYard = 30;
 let flashMsg = '', flashTimer = 0;
 let defSimTimer = 0, defSimMsg = '';
-let ballAir = null; // { x, y, tx, ty, rec, frame, total }
+let ballAir = null;
 let sackTimer = 0;
 let gameOver = false;
 
-// ─── Keys ─────────────────────────────────────────────────────────────────────
 const keys = {};
 document.addEventListener('keydown', e => {
   keys[e.key] = true;
   handleKeyDown(e.key);
+  if ([' ','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
 });
 document.addEventListener('keyup', e => { keys[e.key] = false; });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ── Coordinate helpers ────────────────────────────────────────────────────────
+// Own endzone at BOTTOM (high y), opponent endzone at TOP (low y).
+// yard 0 = bottom of own endzone, yard 100 = back of opponent endzone.
 function yardToY(yard) {
-  // yard 0 = own endzone bottom, yard 100 = opponent endzone top
-  // own endzone at bottom of canvas
   return FIELD_TOP + FIELD_H - yard * PX_PER_YARD;
 }
 function yToYard(y) {
   return (FIELD_TOP + FIELD_H - y) / PX_PER_YARD;
 }
-function dist(a, b) {
-  return Math.hypot(a.x - b.x, a.y - b.y);
-}
-function moveToward(entity, tx, ty, speed) {
-  const d = Math.hypot(tx - entity.x, ty - entity.y);
-  if (d < speed) { entity.x = tx; entity.y = ty; return; }
-  entity.x += (tx - entity.x) / d * speed;
-  entity.y += (ty - entity.y) / d * speed;
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+function moveToward(e, tx, ty, spd) {
+  const d = Math.hypot(tx - e.x, ty - e.y);
+  if (d < spd) { e.x = tx; e.y = ty; return; }
+  e.x += (tx - e.x) / d * spd;
+  e.y += (ty - e.y) / d * spd;
 }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function flash(msg, t = 120) { flashMsg = msg; flashTimer = t; }
 function randBetween(lo, hi) { return lo + Math.random() * (hi - lo); }
+function ordinal(n) { return ['1st','2nd','3rd','4th'][n - 1] || n + 'th'; }
 
-// ─── Route Definitions ────────────────────────────────────────────────────────
+// ── Routes ────────────────────────────────────────────────────────────────────
 const ROUTES = [
-  // Go route: straight up
-  (sx, sy) => [{ x: sx, y: sy - 200 }],
-  // Curl: up then stop
-  (sx, sy) => [{ x: sx, y: sy - 100 }, { x: sx, y: sy - 100 }],
-  // Cross: up then across
-  (sx, sy) => [{ x: sx, y: sy - 80 }, { x: sx + 120, y: sy - 80 }],
-  // Slant: diagonal up-in
-  (sx, sy) => [{ x: sx + 80, y: sy - 120 }],
-  // Out: up then outside
-  (sx, sy) => [{ x: sx, y: sy - 90 }, { x: sx - 100, y: sy - 90 }],
+  (sx, sy) => [{ x: sx,        y: sy - 210 }],                         // Go
+  (sx, sy) => [{ x: sx,        y: sy - 110 }],                         // Curl (hold)
+  (sx, sy) => [{ x: sx,        y: sy -  80 }, { x: sx + 120, y: sy - 80  }], // Cross
+  (sx, sy) => [{ x: sx + 90,   y: sy - 130 }],                         // Slant
+  (sx, sy) => [{ x: sx,        y: sy - 100 }, { x: sx - 110, y: sy - 100 }], // Out
 ];
 
-// ─── Entity Factories ─────────────────────────────────────────────────────────
+// ── Entity factories ──────────────────────────────────────────────────────────
 function makeQB() {
-  return { x: FIELD_LEFT + FIELD_W / 2, y: yardToY(scrimmageYard) - 30 };
+  // QB stands 5 yards BEHIND the LOS (toward own endzone = higher y value)
+  return { x: FIELD_LEFT + FIELD_W / 2, y: yardToY(scrimmageYard) + 28 };
 }
 
 function makeReceivers() {
   const los = yardToY(scrimmageYard);
-  const positions = [
-    { x: FIELD_LEFT + 80,  y: los - 5 },
-    { x: FIELD_LEFT + 160, y: los - 5 },
-    { x: FIELD_LEFT + FIELD_W / 2, y: los - 5 },
-    { x: FIELD_RIGHT - 160, y: los - 5 },
-    { x: FIELD_RIGHT - 80,  y: los - 5 },
+  const xs = [
+    FIELD_LEFT + 70,
+    FIELD_LEFT + 155,
+    FIELD_LEFT + FIELD_W / 2,
+    FIELD_RIGHT - 155,
+    FIELD_RIGHT - 70,
   ];
-  return positions.map((p, i) => ({
-    x: p.x, y: p.y,
-    sx: p.x, sy: p.y, // start pos
+  return xs.map((px, i) => ({
+    x: px, y: los,
     num: i + 1,
-    route: ROUTES[i](p.x, p.y),
+    route: ROUTES[i](px, los),
     routeIdx: 0,
     hasBall: false,
     caught: false,
@@ -126,14 +115,16 @@ function makeReceivers() {
 function makeDefenders() {
   const los = yardToY(scrimmageYard);
   return [
-    { x: FIELD_LEFT + FIELD_W * 0.3, y: los + 15, role: 'rush' },
-    { x: FIELD_LEFT + FIELD_W * 0.7, y: los + 15, role: 'rush' },
-    { x: FIELD_LEFT + FIELD_W * 0.25, y: los - 60, role: 'cover' },
-    { x: FIELD_LEFT + FIELD_W * 0.75, y: los - 60, role: 'cover' },
+    // Defensive rushers: lined up just PAST the LOS on the defensive side
+    // (toward opponent = LOWER y than LOS)
+    { x: FIELD_LEFT + FIELD_W * 0.35, y: los - 18, role: 'rush' },
+    { x: FIELD_LEFT + FIELD_W * 0.65, y: los - 18, role: 'rush' },
+    // Corners/safeties: deeper in the defensive backfield (lower y = farther toward opponent)
+    { x: FIELD_LEFT + FIELD_W * 0.18, y: los - 95, role: 'cover' },
+    { x: FIELD_LEFT + FIELD_W * 0.82, y: los - 95, role: 'cover' },
   ];
 }
 
-// ─── Game Objects ─────────────────────────────────────────────────────────────
 let qb, receivers, defenders, carrier;
 
 function initPlay() {
@@ -146,23 +137,16 @@ function initPlay() {
   state = 'PRE_SNAP';
 }
 
-function resetAfterScore(playerHasball) {
-  if (playerHasball) {
-    scrimmageYard = 20;
-  } else {
-    // opponent kicks off
-    scrimmageYard = 20;
-  }
-  down = 1;
-  distance = 10;
-  firstDownYard = scrimmageYard + distance;
+function resetPossession() {
+  scrimmageYard = 20;
+  down = 1; distance = 10;
+  firstDownYard = 30;
   initPlay();
 }
 
-// Start fresh
-resetAfterScore(true);
+resetPossession();
 
-// ─── Input Handler ────────────────────────────────────────────────────────────
+// ── Input ─────────────────────────────────────────────────────────────────────
 function handleKeyDown(key) {
   if (gameOver) {
     if (key === ' ' || key === 'Enter') restartGame();
@@ -170,41 +154,30 @@ function handleKeyDown(key) {
   }
   if (state === 'PRE_SNAP') {
     if (key === ' ') startPlay();
-    if (key === 'p' || key === 'P') {
-      if (down === 4) doPunt();
-    }
+    if ((key === 'p' || key === 'P') && down === 4) doPunt();
   }
   if (state === 'PLAY_ACTIVE') {
-    const num = parseInt(key);
-    if (num >= 1 && num <= 5) throwTo(num - 1);
+    const n = parseInt(key);
+    if (n >= 1 && n <= 5) throwTo(n - 1);
   }
 }
 
-function startPlay() {
-  state = 'PLAY_ACTIVE';
-  sackTimer = 0;
-}
+function startPlay() { state = 'PLAY_ACTIVE'; sackTimer = 0; }
 
 function throwTo(idx) {
   const rec = receivers[idx];
   if (!rec || rec.caught) return;
-  ballAir = {
-    sx: qb.x, sy: qb.y,
-    tx: rec.x, ty: rec.y,
-    rec: rec,
-    frame: 0,
-    total: BALL_FLIGHT_TIME,
-  };
+  ballAir = { sx: qb.x, sy: qb.y, rec, frame: 0, total: BALL_FLIGHT_TIME, cx: qb.x, cy: qb.y };
   state = 'BALL_IN_AIR';
 }
 
 function doPunt() {
-  const puntYard = Math.min(99, scrimmageYard + 40 + Math.round(randBetween(-10, 10)));
-  flash(`PUNT! Ball to opponent ${100 - puntYard}-yd line`, 120);
-  startDefenseSim(`Opponent possesses at their ${puntYard}-yd line...`);
+  const dest = Math.min(99, scrimmageYard + 40 + Math.round(randBetween(-10, 10)));
+  flash(`PUNT! Ball to their ${100 - dest}-yd line`, 120);
+  startDefenseSim(`Opponent at their own ${100 - dest}-yd line...`);
 }
 
-// ─── Defense Simulation ───────────────────────────────────────────────────────
+// ── Defense sim ───────────────────────────────────────────────────────────────
 function startDefenseSim(msg) {
   state = 'DEFENSE_SIM';
   defSimMsg = msg;
@@ -214,88 +187,69 @@ function startDefenseSim(msg) {
 function resolveDefenseSim() {
   const roll = Math.random();
   if (roll < 0.60) {
-    // 3-and-out, punt back
-    scrimmageYard = 30 + Math.round(randBetween(-5, 5));
-    scrimmageYard = clamp(scrimmageYard, 1, 99);
+    scrimmageYard = clamp(30 + Math.round(randBetween(-5, 5)), 1, 89);
     flash('Opponent punts! Your ball.', 120);
   } else if (roll < 0.85) {
-    // Field goal attempt
-    if (Math.random() < 0.4) {
-      oppScore += 3;
-      flash('Opponent FIELD GOAL! +3', 120);
-    } else {
-      flash('Opponent field goal NO GOOD!', 120);
-      scrimmageYard = 30;
-    }
+    if (Math.random() < 0.4) { oppScore += 3; flash('Opponent FIELD GOAL! +3', 120); }
+    else flash('Opponent FG — no good!', 120);
     scrimmageYard = 20;
   } else {
-    // TD
     oppScore += 7;
     flash('Opponent TOUCHDOWN! +7', 150);
     scrimmageYard = 20;
   }
   down = 1; distance = 10;
-  firstDownYard = scrimmageYard + distance;
+  firstDownYard = scrimmageYard + 10;
   initPlay();
   state = 'PRE_SNAP';
 }
 
-// ─── Update Functions ─────────────────────────────────────────────────────────
-function updatePreSnap(dt) {
-  moveQB();
-}
+// ── Update ────────────────────────────────────────────────────────────────────
+function updatePreSnap()  { moveQB(); }
 
-function updatePlayActive(dt) {
+function updatePlayActive() {
   moveQB();
   moveReceivers();
   moveDefenders();
   sackTimer++;
-  // Check sack
   for (const def of defenders) {
-    if (dist(def, qb) < TACKLE_RADIUS) {
-      doSack();
-      return;
-    }
+    if (dist(def, qb) < TACKLE_RADIUS) { doSack(); return; }
   }
-  // Auto-sack after timeout
   if (sackTimer >= SACK_TIME) doSack();
 }
 
 function doSack() {
-  const yardLoss = Math.round(randBetween(3, 10));
-  scrimmageYard = Math.max(1, scrimmageYard - yardLoss);
-  flash(`SACK! -${yardLoss} yards`, 120);
+  const loss = Math.round(randBetween(3, 10));
+  scrimmageYard = Math.max(1, scrimmageYard - loss);
+  flash(`SACK! -${loss} yards`, 120);
   advanceDown(scrimmageYard);
 }
 
-function updateBallInAir(dt) {
+function updateBallInAir() {
   moveReceivers();
   moveDefenders();
   if (!ballAir) return;
   ballAir.frame++;
   const t = ballAir.frame / ballAir.total;
-  ballAir.cx = ballAir.sx + (ballAir.tx - ballAir.sx) * t;
-  ballAir.cy = ballAir.sy + (ballAir.ty - ballAir.sy) * t - Math.sin(Math.PI * t) * 60;
+
+  // Track receiver's CURRENT position so ball lands exactly on them
+  const tx = ballAir.rec.x;
+  const ty = ballAir.rec.y;
+  ballAir.cx = ballAir.sx + (tx - ballAir.sx) * t;
+  ballAir.cy = ballAir.sy + (ty - ballAir.sy) * t - Math.sin(Math.PI * t) * 55;
 
   if (ballAir.frame >= ballAir.total) {
-    // Check interception
     let intercepted = false;
     for (const def of defenders) {
       const d = dist(def, ballAir.rec);
-      if (d < INTERCEPT_RADIUS) {
-        const chance = 0.4 * (1 - d / INTERCEPT_RADIUS);
-        if (Math.random() < chance) {
-          intercepted = true;
-          break;
-        }
+      if (d < INTERCEPT_RADIUS && Math.random() < 0.45 * (1 - d / INTERCEPT_RADIUS)) {
+        intercepted = true; break;
       }
     }
     if (intercepted) {
       flash('INTERCEPTED! Turnover!', 150);
-      scrimmageYard = Math.max(1, Math.round(yToYard(ballAir.rec.y)));
-      startDefenseSim('Opponent has the ball after interception...');
+      startDefenseSim('Opponent has the ball — interception...');
     } else {
-      // Catch
       ballAir.rec.caught = true;
       ballAir.rec.hasBall = true;
       carrier = ballAir.rec;
@@ -305,40 +259,25 @@ function updateBallInAir(dt) {
   }
 }
 
-function updateReceiverRunning(dt) {
+function updateReceiverRunning() {
   if (!carrier) return;
-  // Move carrier with WASD
   if (keys['w'] || keys['W']) carrier.y -= REC_SPEED;
   if (keys['s'] || keys['S']) carrier.y += REC_SPEED;
   if (keys['a'] || keys['A']) carrier.x -= REC_SPEED;
   if (keys['d'] || keys['D']) carrier.x += REC_SPEED;
   carrier.x = clamp(carrier.x, FIELD_LEFT + 5, FIELD_RIGHT - 5);
-  carrier.y = clamp(carrier.y, FIELD_TOP + 5, H - 5);
+  // Allow player to reach opponent endzone (y can go as low as FIELD_TOP)
+  carrier.y = clamp(carrier.y, FIELD_TOP + 2, H - 5);
 
-  // Defenders pursue
-  for (const def of defenders) {
-    moveToward(def, carrier.x, carrier.y, DEF_COVER_SPEED);
-  }
+  for (const def of defenders) moveToward(def, carrier.x, carrier.y, DEF_COVER_SPEED);
 
-  // Touchdown?
   const cy = yToYard(carrier.y);
-  if (cy >= 100) {
-    doTouchdown();
-    return;
-  }
-
-  // Tackle?
+  // Touchdown: crossing into opponent endzone (yard >= 90)
+  if (cy >= 90) { doTouchdown(); return; }
   for (const def of defenders) {
-    if (dist(def, carrier) < TACKLE_RADIUS) {
-      doTackle(cy);
-      return;
-    }
+    if (dist(def, carrier) < TACKLE_RADIUS) { doTackle(cy); return; }
   }
-
-  // Out of bounds = tackle at current position
-  if (carrier.x <= FIELD_LEFT || carrier.x >= FIELD_RIGHT) {
-    doTackle(cy);
-  }
+  if (carrier.x <= FIELD_LEFT || carrier.x >= FIELD_RIGHT) doTackle(cy);
 }
 
 function moveQB() {
@@ -346,446 +285,434 @@ function moveQB() {
   if (keys['s'] || keys['S']) qb.y += QB_SPEED;
   if (keys['a'] || keys['A']) qb.x -= QB_SPEED;
   if (keys['d'] || keys['D']) qb.x += QB_SPEED;
-  // Pocket constraint (pre-snap)
-  const pocketTop = yardToY(scrimmageYard) - 15 * PX_PER_YARD;
-  const pocketBot = yardToY(scrimmageYard) + 5 * PX_PER_YARD;
+  // QB stays BEHIND the LOS (higher y) — pocket is 2..15 yards behind LOS
+  const losY = yardToY(scrimmageYard);
   qb.x = clamp(qb.x, FIELD_LEFT + 5, FIELD_RIGHT - 5);
-  qb.y = clamp(qb.y, Math.max(FIELD_TOP + 5, pocketTop), Math.min(H - 5, pocketBot));
+  qb.y = clamp(qb.y, losY + 2, Math.min(H - 5, losY + 15 * PX_PER_YARD));
 }
 
 function moveReceivers() {
   for (const rec of receivers) {
     if (rec.caught) continue;
-    const waypoints = rec.route;
-    if (rec.routeIdx < waypoints.length) {
-      const wp = waypoints[rec.routeIdx];
-      const clamped = {
-        x: clamp(wp.x, FIELD_LEFT + 10, FIELD_RIGHT - 10),
-        y: clamp(wp.y, FIELD_TOP + 10, H - 10),
-      };
-      moveToward(rec, clamped.x, clamped.y, REC_SPEED);
-      if (dist(rec, clamped) < 5) rec.routeIdx++;
+    if (rec.routeIdx < rec.route.length) {
+      const wp = rec.route[rec.routeIdx];
+      const cx = clamp(wp.x, FIELD_LEFT + 10, FIELD_RIGHT - 10);
+      const cy = clamp(wp.y, FIELD_TOP + 10, H - 10);
+      moveToward(rec, cx, cy, REC_SPEED);
+      if (dist(rec, { x: cx, y: cy }) < 5) rec.routeIdx++;
     }
   }
 }
 
 function moveDefenders() {
   const rushers = defenders.filter(d => d.role === 'rush');
-  const covers = defenders.filter(d => d.role === 'cover');
+  const covers  = defenders.filter(d => d.role === 'cover');
 
   if (state === 'PLAY_ACTIVE') {
     for (const r of rushers) moveToward(r, qb.x, qb.y, DEF_RUSH_SPEED);
+  } else if (state === 'BALL_IN_AIR' && ballAir) {
+    for (const r of rushers) moveToward(r, ballAir.rec.x, ballAir.rec.y, DEF_RUSH_SPEED);
   }
 
-  // Cover nearest receiver
-  const uncovered = [...receivers];
-  for (let i = 0; i < covers.length; i++) {
-    const def = covers[i];
-    const target = uncovered.reduce((best, rec) => {
-      return best === null || dist(def, rec) < dist(def, best) ? rec : best;
-    }, null);
-    if (target) {
-      moveToward(def, target.x, target.y, DEF_COVER_SPEED);
-    }
+  for (const def of covers) {
+    const target = receivers.reduce(
+      (best, rec) => best === null || dist(def, rec) < dist(def, best) ? rec : best, null
+    );
+    if (target) moveToward(def, target.x, target.y, DEF_COVER_SPEED);
   }
 }
 
 function doTouchdown() {
   playerScore += 7;
   flash('TOUCHDOWN! +7', 180);
-  state = 'DEFENSE_SIM';
-  defSimMsg = 'Kickoff — Opponent receives...';
-  defSimTimer = DEFENSE_SIM_TIME;
-  scrimmageYard = 20;
-  down = 1; distance = 10;
-  firstDownYard = 30;
+  startDefenseSim('Kickoff — opponent receives...');
 }
 
 function doTackle(yardNow) {
-  const gained = yardNow - scrimmageYard;
-  scrimmageYard = clamp(Math.round(yardNow), 1, 99);
+  scrimmageYard = clamp(Math.round(yardNow), 1, 89);
   advanceDown(scrimmageYard);
 }
 
 function advanceDown(newScrimmage) {
   if (newScrimmage >= firstDownYard) {
-    // First down!
-    down = 1;
-    distance = 10;
+    down = 1; distance = 10;
     firstDownYard = newScrimmage + 10;
     flash('FIRST DOWN!', 90);
     initPlay();
-    state = 'PRE_SNAP';
   } else {
     down++;
     distance = firstDownYard - newScrimmage;
     if (down > 4) {
-      // Turnover on downs
       flash('Turnover on downs!', 120);
-      startDefenseSim('Opponent takes over...');
+      startDefenseSim('Opponent takes over on downs...');
     } else {
-      flash(`${ordinal(down)} & ${distance}`, 60);
+      flash(`${ordinal(down)} & ${Math.round(distance)}`, 60);
       initPlay();
-      state = 'PRE_SNAP';
     }
   }
 }
 
-function ordinal(n) {
-  return ['1st','2nd','3rd','4th'][n - 1] || n + 'th';
-}
-
-// ─── Timer ────────────────────────────────────────────────────────────────────
 function updateTimer(dt) {
-  if (state === 'PRE_SNAP' || state === 'DEFENSE_SIM') return; // clock runs during play
   timerAccum += dt;
   if (timerAccum >= 1000) {
     timerAccum -= 1000;
     timeLeft--;
     if (timeLeft <= 0) {
       if (quarter < 4) {
-        quarter++;
-        timeLeft = QUARTER_DURATION;
+        quarter++; timeLeft = QUARTER_DURATION;
         flash(`Quarter ${quarter}!`, 120);
-        initPlay();
-        state = 'PRE_SNAP';
+        initPlay(); state = 'PRE_SNAP';
       } else {
-        gameOver = true;
-        state = 'GAME_OVER';
+        gameOver = true; state = 'GAME_OVER';
       }
     }
   }
 }
 
-// ─── Defense Sim Timer ────────────────────────────────────────────────────────
-function updateDefSim(dt) {
+function updateDefSim() {
   defSimTimer--;
   if (defSimTimer <= 0) resolveDefenseSim();
 }
 
-// ─── Rendering ────────────────────────────────────────────────────────────────
+// ── Rendering ─────────────────────────────────────────────────────────────────
 function drawField() {
-  // Sky/grass background
   ctx.fillStyle = '#2d6a2d';
   ctx.fillRect(0, FIELD_TOP, W, FIELD_H);
 
   // Endzones
   ctx.fillStyle = '#1a4a8a';
   ctx.fillRect(0, FIELD_TOP, W, ENDZONES * PX_PER_YARD);
-  ctx.fillStyle = '#8a1a1a';
+  ctx.fillStyle = '#7a1a1a';
   ctx.fillRect(0, FIELD_TOP + FIELD_H - ENDZONES * PX_PER_YARD, W, ENDZONES * PX_PER_YARD);
 
-  // Endzone text
-  ctx.fillStyle = 'rgba(255,255,255,0.3)';
-  ctx.font = 'bold 24px Arial';
-  ctx.textAlign = 'center';
-  ctx.fillText('OPPONENT', W / 2, FIELD_TOP + ENDZONES * PX_PER_YARD / 2 + 8);
-  ctx.fillText('END ZONE', W / 2, FIELD_TOP + ENDZONES * PX_PER_YARD / 2 + 32);
-  ctx.fillText('YOUR END ZONE', W / 2, FIELD_TOP + FIELD_H - ENDZONES * PX_PER_YARD / 2 + 8);
+  ctx.fillStyle = 'rgba(255,255,255,0.22)';
+  ctx.font = 'bold 18px Arial'; ctx.textAlign = 'center';
+  ctx.fillText('OPPONENT END ZONE', W / 2, FIELD_TOP + ENDZONES * PX_PER_YARD / 2 + 6);
+  ctx.fillText('YOUR END ZONE',     W / 2, FIELD_TOP + FIELD_H - ENDZONES * PX_PER_YARD / 2 + 6);
 
-  // Yard lines every 10 yards
-  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
-  ctx.lineWidth = 1;
+  // Yard lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)'; ctx.lineWidth = 1;
   for (let y = 10; y <= 90; y += 10) {
     const py = yardToY(y);
-    ctx.beginPath();
-    ctx.moveTo(FIELD_LEFT, py);
-    ctx.lineTo(FIELD_RIGHT, py);
-    ctx.stroke();
-    ctx.fillStyle = 'rgba(255,255,255,0.7)';
-    ctx.font = '11px Arial';
-    ctx.textAlign = 'left';
-    ctx.fillText(y < 50 ? y : 100 - y, FIELD_LEFT + 4, py - 2);
-    ctx.textAlign = 'right';
-    ctx.fillText(y < 50 ? y : 100 - y, FIELD_RIGHT - 4, py - 2);
+    ctx.beginPath(); ctx.moveTo(FIELD_LEFT, py); ctx.lineTo(FIELD_RIGHT, py); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.font = '11px Arial';
+    const label = y <= 50 ? y : 100 - y;
+    ctx.textAlign = 'left';  ctx.fillText(label, FIELD_LEFT + 4,   py - 2);
+    ctx.textAlign = 'right'; ctx.fillText(label, FIELD_RIGHT - 4,  py - 2);
   }
 
-  // Hash marks every 5 yards
-  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+  // Hash marks
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 1;
   for (let y = 5; y <= 95; y += 5) {
     if (y % 10 === 0) continue;
     const py = yardToY(y);
     ctx.beginPath();
-    ctx.moveTo(FIELD_LEFT + FIELD_W * 0.3, py);
-    ctx.lineTo(FIELD_LEFT + FIELD_W * 0.35, py);
-    ctx.moveTo(FIELD_LEFT + FIELD_W * 0.65, py);
-    ctx.lineTo(FIELD_LEFT + FIELD_W * 0.7, py);
+    ctx.moveTo(FIELD_LEFT + FIELD_W * 0.30, py); ctx.lineTo(FIELD_LEFT + FIELD_W * 0.35, py);
+    ctx.moveTo(FIELD_LEFT + FIELD_W * 0.65, py); ctx.lineTo(FIELD_LEFT + FIELD_W * 0.70, py);
     ctx.stroke();
   }
 
   // Sidelines
-  ctx.strokeStyle = 'white';
-  ctx.lineWidth = 2;
+  ctx.strokeStyle = 'white'; ctx.lineWidth = 2;
   ctx.strokeRect(FIELD_LEFT, FIELD_TOP, FIELD_W, FIELD_H);
 
-  // Line of scrimmage
+  // Line of scrimmage (yellow dashed)
   const losY = yardToY(scrimmageYard);
-  ctx.strokeStyle = '#ffff00';
-  ctx.lineWidth = 2;
-  ctx.setLineDash([6, 4]);
-  ctx.beginPath();
-  ctx.moveTo(FIELD_LEFT, losY);
-  ctx.lineTo(FIELD_RIGHT, losY);
-  ctx.stroke();
+  ctx.strokeStyle = '#ffff00'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+  ctx.beginPath(); ctx.moveTo(FIELD_LEFT, losY); ctx.lineTo(FIELD_RIGHT, losY); ctx.stroke();
   ctx.setLineDash([]);
 
-  // First down line
-  if (firstDownYard <= 100) {
+  // First-down line (blue dashed)
+  if (firstDownYard < 100) {
     const fdY = yardToY(firstDownYard);
-    ctx.strokeStyle = '#00aaff';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(FIELD_LEFT, fdY);
-    ctx.lineTo(FIELD_RIGHT, fdY);
-    ctx.stroke();
+    ctx.strokeStyle = '#00aaff'; ctx.lineWidth = 2; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(FIELD_LEFT, fdY); ctx.lineTo(FIELD_RIGHT, fdY); ctx.stroke();
     ctx.setLineDash([]);
   }
 }
 
 function drawHUD() {
-  // Top bar
-  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  ctx.fillStyle = 'rgba(0,0,0,0.88)';
   ctx.fillRect(0, 0, W, FIELD_TOP);
 
-  ctx.fillStyle = 'white';
-  ctx.font = 'bold 18px Arial';
+  ctx.fillStyle = 'white'; ctx.font = 'bold 18px Arial';
+  ctx.textAlign = 'left';  ctx.fillText(`YOU: ${playerScore}`, 10, 38);
+  ctx.textAlign = 'right'; ctx.fillText(`OPP: ${oppScore}`, W - 10, 38);
+
+  const mm = String(Math.floor(timeLeft / 60)).padStart(2,'0');
+  const ss = String(timeLeft % 60).padStart(2,'0');
+  ctx.textAlign = 'center'; ctx.fillText(`Q${quarter}  ${mm}:${ss}`, W / 2, 38);
+
+  ctx.font = '13px Arial'; ctx.fillStyle = '#ffcc00';
+  ctx.fillText(`${ordinal(down)} & ${Math.round(distance)}  |  Ball: ${scrimmageYard}-yd line`, W / 2, 17);
+
+  ctx.font = '11px Arial'; ctx.fillStyle = '#666';
   ctx.textAlign = 'left';
-  ctx.fillText(`YOU: ${playerScore}`, 10, 38);
-
-  ctx.textAlign = 'right';
-  ctx.fillText(`OPP: ${oppScore}`, W - 10, 38);
-
-  ctx.textAlign = 'center';
-  const mins = Math.floor(timeLeft / 60).toString().padStart(2, '0');
-  const secs = (timeLeft % 60).toString().padStart(2, '0');
-  ctx.fillText(`Q${quarter}  ${mins}:${secs}`, W / 2, 38);
-
-  // Down & distance
-  ctx.font = '14px Arial';
-  ctx.fillStyle = '#ffcc00';
-  ctx.fillText(`${ordinal(down)} & ${distance} | Ball: own ${scrimmageYard}-yd`, W / 2, 18);
-
-  // Controls hint
-  ctx.font = '11px Arial';
-  ctx.fillStyle = '#888';
-  ctx.textAlign = 'left';
-  ctx.fillText('WASD=Move  SPACE=Hike  1-5=Throw  P=Punt(4th)', 10, 18);
+  ctx.fillText('WASD=Move  SPACE=Hike  1-5=Throw  P=Punt(4th)', 10, 17);
 }
 
-function drawCircle(x, y, r, fill, stroke, label, labelColor) {
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fillStyle = fill;
-  ctx.fill();
-  if (stroke) {
-    ctx.strokeStyle = stroke;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-  }
-  if (label) {
-    ctx.fillStyle = labelColor || 'black';
-    ctx.font = 'bold 12px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText(label, x, y + 4);
-  }
-}
+// ── Cartoon player drawing ────────────────────────────────────────────────────
+// Each player is drawn centered at (0,0) then translated to (x,y).
+// helmetColor = main helmet color, jerseyColor = jersey/body color
+// label = number or position text drawn on jersey
+// hasBall = draw a ball tucked in arm
 
-function drawBall(x, y) {
+function drawPlayer(x, y, helmetColor, jerseyColor, label, hasBall) {
   ctx.save();
   ctx.translate(x, y);
+
+  const scale = hasBall ? 1.18 : 1.0;
+  ctx.scale(scale, scale);
+
+  // Ground shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.20)';
+  ctx.beginPath();
+  ctx.ellipse(1, 20, 11, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ── Legs & cleats ──
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(-4,  8); ctx.lineTo(-5, 19); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo( 4,  8); ctx.lineTo( 5, 19); ctx.stroke();
+  // cleats
+  ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(-5, 19); ctx.lineTo(-9, 22); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo( 5, 19); ctx.lineTo( 9, 22); ctx.stroke();
+
+  // ── Jersey (body) — trapezoid wider at shoulders ──
+  ctx.fillStyle = jerseyColor;
+  ctx.beginPath();
+  ctx.moveTo(-9, -4);
+  ctx.lineTo(-11, 0);
+  ctx.lineTo(-9,  9);
+  ctx.lineTo( 9,  9);
+  ctx.lineTo(11,  0);
+  ctx.lineTo( 9, -4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.28)'; ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Jersey number / label on chest
+  if (label) {
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.font = `bold ${label.length > 2 ? '6' : '7.5'}px Arial`;
+    ctx.textAlign = 'center';
+    ctx.fillText(label, 0, 6);
+  }
+
+  // ── Shoulder pads (bumps at top of jersey) ──
+  ctx.fillStyle = jerseyColor;
+  ctx.beginPath(); ctx.ellipse(-11, -2, 5, 3, -0.3, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse( 11, -2, 5, 3,  0.3, 0, Math.PI * 2); ctx.fill();
+
+  // ── Arms ──
+  ctx.strokeStyle = jerseyColor; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-10, 0); ctx.lineTo(-16, 8); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo( 10, 0); ctx.lineTo( 16, 8); ctx.stroke();
+
+  // ── Hands / gloves ──
+  const gloveColor = hasBall ? '#8B4513' : '#cc7755';
+  ctx.fillStyle = gloveColor;
+  ctx.beginPath(); ctx.arc(-16, 9, 3.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc( 16, 9, 3.5, 0, Math.PI * 2); ctx.fill();
+
+  // ── Ball tucked in right arm ──
+  if (hasBall) {
+    ctx.fillStyle = '#8B4513';
+    ctx.beginPath();
+    ctx.ellipse(18, 7, 7, 4.5, -0.4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'white'; ctx.lineWidth = 0.9;
+    ctx.beginPath(); ctx.moveTo(13, 7); ctx.lineTo(23, 7); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(17, 3); ctx.lineTo(19, 3); ctx.stroke();
+  }
+
+  // ── Helmet ──
+  ctx.fillStyle = helmetColor;
+  ctx.beginPath();
+  ctx.arc(0, -10, 11, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Helmet stripe (central white stripe)
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)'; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(0, -21); ctx.lineTo(0, -9); ctx.stroke();
+
+  // ── Facemask (two horizontal bars) ──
+  ctx.strokeStyle = 'rgba(200,210,200,0.9)'; ctx.lineWidth = 1.8; ctx.lineCap = 'round';
+  // outer arc
+  ctx.beginPath(); ctx.arc(0, -8, 8.5, 0.22, Math.PI - 0.22); ctx.stroke();
+  // inner bar
+  ctx.beginPath(); ctx.moveTo(-7, -11); ctx.lineTo(7, -11); ctx.stroke();
+
+  // ── Neck ──
+  ctx.fillStyle = '#c8845a';
+  ctx.fillRect(-3, -2, 6, 4);
+
+  ctx.restore();
+}
+
+function drawBallInFlight(x, y, dx, dy) {
+  ctx.save();
+  ctx.translate(x, y);
+  const angle = Math.atan2(dy, dx);
+  ctx.rotate(angle);
   ctx.fillStyle = '#8B4513';
   ctx.beginPath();
-  ctx.ellipse(0, 0, 8, 5, -Math.PI / 5, 0, Math.PI * 2);
+  ctx.ellipse(0, 0, 9, 5.5, 0, 0, Math.PI * 2);
   ctx.fill();
-  ctx.strokeStyle = 'white';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(-4, 0);
-  ctx.lineTo(4, 0);
-  ctx.stroke();
+  ctx.strokeStyle = 'white'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(-5, 0); ctx.lineTo(5, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-2, -3.5); ctx.lineTo(2, -3.5); ctx.stroke();
   ctx.restore();
 }
 
 function drawEntities() {
-  // Defenders
-  for (const def of defenders) {
-    drawCircle(def.x, def.y, 13, '#cc2222', '#ff4444', 'D', 'white');
-  }
-
-  // Receivers
-  for (const rec of receivers) {
-    const hasBall = rec.hasBall;
-    const color = hasBall ? '#aaff00' : '#22cc44';
-    const r = hasBall ? 16 : 13;
-    drawCircle(rec.x, rec.y, r, color, '#00ff66', `${rec.num}`, 'black');
-  }
-
-  // QB
-  drawCircle(qb.x, qb.y, 14, '#ffdd00', '#ffaa00', 'QB', '#333');
-
-  // Ball in air
-  if (ballAir && ballAir.cx !== undefined) {
-    drawBall(ballAir.cx, ballAir.cy);
-  }
-
-  // Route dots (pre-snap)
+  // Pre-snap route previews
   if (state === 'PRE_SNAP') {
-    ctx.fillStyle = 'rgba(0,255,100,0.3)';
     for (const rec of receivers) {
+      ctx.strokeStyle = 'rgba(0,255,100,0.28)'; ctx.lineWidth = 1.5; ctx.setLineDash([3, 4]);
+      ctx.beginPath(); ctx.moveTo(rec.x, rec.y);
       for (const wp of rec.route) {
-        const cx = clamp(wp.x, FIELD_LEFT + 10, FIELD_RIGHT - 10);
-        const cy = clamp(wp.y, FIELD_TOP + 10, H - 10);
-        ctx.beginPath();
-        ctx.arc(cx, cy, 4, 0, Math.PI * 2);
-        ctx.fill();
-        // Line from receiver to waypoint
-        ctx.strokeStyle = 'rgba(0,255,100,0.2)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(rec.x, rec.y);
-        ctx.lineTo(cx, cy);
-        ctx.stroke();
+        ctx.lineTo(clamp(wp.x, FIELD_LEFT+10, FIELD_RIGHT-10),
+                   clamp(wp.y, FIELD_TOP+10, H-10));
       }
+      ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(0,255,100,0.4)';
+      const last = rec.route[rec.route.length - 1];
+      ctx.beginPath();
+      ctx.arc(clamp(last.x, FIELD_LEFT+10, FIELD_RIGHT-10),
+              clamp(last.y, FIELD_TOP+10, H-10), 4, 0, Math.PI*2);
+      ctx.fill();
     }
+  }
+
+  // Defenders (red helmet, dark red jersey)
+  for (const def of defenders) {
+    drawPlayer(def.x, def.y, '#cc1111', '#881111', 'D', false);
+  }
+
+  // Receivers (green helmet, mid-green jersey)
+  for (const rec of receivers) {
+    drawPlayer(rec.x, rec.y, '#1a7020', '#22aa28', `${rec.num}`, rec.hasBall);
+  }
+
+  // QB (gold helmet, yellow jersey)
+  drawPlayer(qb.x, qb.y, '#cc9900', '#ffcc00', 'QB', false);
+
+  // Ball in flight
+  if (ballAir && ballAir.cx !== undefined) {
+    // Compute flight direction for rotation
+    const t = Math.min(ballAir.frame / ballAir.total, 1);
+    const tx = ballAir.rec.x, ty = ballAir.rec.y;
+    // derivative of x(t): (tx - sx), derivative of y(t): (ty - sy) - pi*cos(pi*t)*55
+    const dx = tx - ballAir.sx;
+    const dy = (ty - ballAir.sy) - Math.PI * Math.cos(Math.PI * t) * 55;
+    drawBallInFlight(ballAir.cx, ballAir.cy, dx, dy);
   }
 }
 
 function drawFlash() {
-  if (flashTimer > 0) {
-    const alpha = Math.min(1, flashTimer / 30);
-    ctx.fillStyle = `rgba(0,0,0,${alpha * 0.6})`;
-    ctx.fillRect(W / 2 - 200, H / 2 - 30, 400, 60);
-    ctx.fillStyle = `rgba(255,220,0,${alpha})`;
-    ctx.font = 'bold 22px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText(flashMsg, W / 2, H / 2 + 8);
-    flashTimer--;
-  }
-}
-
-function drawDefSim() {
-  ctx.fillStyle = 'rgba(0,0,0,0.75)';
-  ctx.fillRect(0, FIELD_TOP, W, FIELD_H);
-  ctx.fillStyle = 'white';
-  ctx.font = 'bold 24px Arial';
-  ctx.textAlign = 'center';
-  ctx.fillText('DEFENSE SIMULATION', W / 2, H / 2 - 20);
-  ctx.font = '18px Arial';
-  ctx.fillStyle = '#aaa';
-  ctx.fillText(defSimMsg, W / 2, H / 2 + 20);
-  const dots = '.'.repeat(Math.floor(Date.now() / 500) % 4);
-  ctx.fillText(`Simulating${dots}`, W / 2, H / 2 + 55);
-}
-
-function drawGameOver() {
-  ctx.fillStyle = 'rgba(0,0,0,0.85)';
-  ctx.fillRect(0, 0, W, H);
-  ctx.fillStyle = '#ffdd00';
-  ctx.font = 'bold 48px Arial';
-  ctx.textAlign = 'center';
-  ctx.fillText('GAME OVER', W / 2, H / 2 - 80);
-
-  ctx.font = 'bold 32px Arial';
-  ctx.fillStyle = 'white';
-  ctx.fillText(`YOU ${playerScore}  —  OPP ${oppScore}`, W / 2, H / 2 - 20);
-
-  let result;
-  if (playerScore > oppScore) result = 'YOU WIN!';
-  else if (playerScore < oppScore) result = 'YOU LOSE!';
-  else result = "IT'S A TIE!";
-
-  ctx.fillStyle = playerScore > oppScore ? '#00ff88' : '#ff4444';
-  ctx.font = 'bold 36px Arial';
-  ctx.fillText(result, W / 2, H / 2 + 40);
-
-  ctx.fillStyle = '#aaa';
-  ctx.font = '20px Arial';
-  ctx.fillText('Press SPACE or ENTER to play again', W / 2, H / 2 + 100);
+  if (flashTimer <= 0) return;
+  const alpha = Math.min(1, flashTimer / 25);
+  ctx.fillStyle = `rgba(0,0,0,${alpha * 0.55})`;
+  ctx.fillRect(W/2 - 230, H/2 - 34, 460, 68);
+  ctx.fillStyle = `rgba(255,220,0,${alpha})`;
+  ctx.font = 'bold 24px Arial'; ctx.textAlign = 'center';
+  ctx.fillText(flashMsg, W/2, H/2 + 10);
 }
 
 function drawStateOverlay() {
   if (state === 'PRE_SNAP') {
-    ctx.fillStyle = 'rgba(255,255,255,0.7)';
-    ctx.font = '14px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText('PRESS SPACE TO HIKE', W / 2, FIELD_TOP + 20);
+    ctx.fillStyle = 'rgba(255,255,255,0.75)'; ctx.font = '14px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('PRESS SPACE TO HIKE', W/2, FIELD_TOP + 20);
     if (down === 4) {
-      ctx.fillStyle = 'rgba(255,150,0,0.9)';
-      ctx.fillText('4th DOWN — P to Punt', W / 2, FIELD_TOP + 38);
+      ctx.fillStyle = 'rgba(255,150,0,0.95)';
+      ctx.fillText('4th DOWN — P to Punt', W/2, FIELD_TOP + 38);
     }
   }
   if (state === 'PLAY_ACTIVE') {
     const t = 1 - sackTimer / SACK_TIME;
-    ctx.fillStyle = t > 0.4 ? 'rgba(255,255,255,0.7)' : 'rgba(255,60,60,0.9)';
-    ctx.font = '14px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText(`PRESS 1-5 TO THROW  |  Pocket: ${Math.ceil(t * 100)}%`, W / 2, FIELD_TOP + 20);
+    ctx.fillStyle = t > 0.4 ? 'rgba(255,255,255,0.78)' : 'rgba(255,60,60,0.95)';
+    ctx.font = '14px Arial'; ctx.textAlign = 'center';
+    ctx.fillText(`PRESS 1–5 TO THROW  |  Rush pressure: ${Math.ceil((1-t)*100)}%`, W/2, FIELD_TOP + 20);
   }
   if (state === 'RECEIVER_RUNNING') {
-    ctx.fillStyle = 'rgba(0,255,100,0.8)';
-    ctx.font = '14px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText('WASD to run! Get to the end zone!', W / 2, FIELD_TOP + 20);
+    ctx.fillStyle = 'rgba(80,255,120,0.92)'; ctx.font = '14px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('WASD to run! Reach the opponent end zone!', W/2, FIELD_TOP + 20);
   }
+  if (state === 'BALL_IN_AIR') {
+    ctx.fillStyle = 'rgba(255,210,0,0.85)'; ctx.font = '14px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('Ball in the air...', W/2, FIELD_TOP + 20);
+  }
+}
+
+function drawDefSim() {
+  ctx.fillStyle = 'rgba(0,0,0,0.80)';
+  ctx.fillRect(0, FIELD_TOP, W, FIELD_H);
+  ctx.fillStyle = 'white'; ctx.font = 'bold 26px Arial'; ctx.textAlign = 'center';
+  ctx.fillText('DEFENSE SIMULATION', W/2, H/2 - 26);
+  ctx.font = '18px Arial'; ctx.fillStyle = '#bbb';
+  ctx.fillText(defSimMsg, W/2, H/2 + 16);
+  const dots = '.'.repeat(Math.floor(Date.now() / 500) % 4);
+  ctx.fillText(`Simulating${dots}`, W/2, H/2 + 54);
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.90)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#ffdd00'; ctx.font = 'bold 52px Arial'; ctx.textAlign = 'center';
+  ctx.fillText('GAME OVER', W/2, H/2 - 90);
+  ctx.font = 'bold 32px Arial'; ctx.fillStyle = 'white';
+  ctx.fillText(`YOU  ${playerScore}  —  ${oppScore}  OPP`, W/2, H/2 - 25);
+  const result = playerScore > oppScore ? 'YOU WIN!' : playerScore < oppScore ? 'YOU LOSE!' : "TIE GAME";
+  ctx.fillStyle = playerScore > oppScore ? '#00ff88' : '#ff5555';
+  ctx.font = 'bold 38px Arial'; ctx.fillText(result, W/2, H/2 + 40);
+  ctx.fillStyle = '#999'; ctx.font = '20px Arial';
+  ctx.fillText('Press SPACE or ENTER to play again', W/2, H/2 + 100);
 }
 
 function restartGame() {
   playerScore = 0; oppScore = 0;
   quarter = 1; timeLeft = QUARTER_DURATION;
-  timerAccum = 0;
-  gameOver = false;
-  scrimmageYard = 20;
-  down = 1; distance = 10;
-  firstDownYard = 30;
+  timerAccum = 0; gameOver = false;
   flashMsg = ''; flashTimer = 0;
-  resetAfterScore(true);
+  resetPossession();
 }
 
-// ─── Main Loop ────────────────────────────────────────────────────────────────
+// ── Main loop ─────────────────────────────────────────────────────────────────
 function update(dt) {
   if (gameOver) return;
   if (flashTimer > 0) flashTimer--;
 
   switch (state) {
-    case 'PRE_SNAP':       updatePreSnap(dt); break;
-    case 'PLAY_ACTIVE':    updatePlayActive(dt); break;
-    case 'BALL_IN_AIR':    updateBallInAir(dt); break;
-    case 'RECEIVER_RUNNING': updateReceiverRunning(dt); break;
-    case 'DEFENSE_SIM':    updateDefSim(dt); break;
+    case 'PRE_SNAP':         updatePreSnap();         break;
+    case 'PLAY_ACTIVE':      updatePlayActive();      break;
+    case 'BALL_IN_AIR':      updateBallInAir();       break;
+    case 'RECEIVER_RUNNING': updateReceiverRunning(); break;
+    case 'DEFENSE_SIM':      updateDefSim();          break;
   }
 
-  if (state !== 'PRE_SNAP' && state !== 'DEFENSE_SIM') {
-    updateTimer(dt);
-  }
+  // Clock only ticks during live play
+  if (state !== 'PRE_SNAP' && state !== 'DEFENSE_SIM') updateTimer(dt);
 }
 
 function render() {
   ctx.clearRect(0, 0, W, H);
   drawField();
   drawHUD();
-
-  if (gameOver) {
-    drawGameOver();
-    return;
-  }
-
-  if (state === 'DEFENSE_SIM') {
-    drawDefSim();
-    drawHUD();
-    return;
-  }
-
+  if (gameOver)              { drawGameOver(); return; }
+  if (state === 'DEFENSE_SIM') { drawDefSim(); drawHUD(); return; }
   drawEntities();
   drawStateOverlay();
   drawFlash();
 }
 
 function loop(ts) {
-  const dt = ts - lastTime;
-  lastTime = ts;
-  update(dt);
-  render();
+  const dt = ts - lastTime; lastTime = ts;
+  update(dt); render();
   requestAnimationFrame(loop);
 }
 
